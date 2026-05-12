@@ -1,0 +1,15 @@
+# 推荐：本机运行 CLI（项目根目录 python cli.py），仅用 Docker 提供 Redis（Skill 缓存等）。
+#   docker compose up -d
+# Redis 暴露到宿主机 6379，config.ini [SKILL_CACHE] redis_host=127.0.0.1（勿设 REDIS_HOST=redis，该主机名只在容器网络内有效）。
+services:
+  redis:
+    image: docker.io/valkey/valkey:8-bookworm
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PUBLISH_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s

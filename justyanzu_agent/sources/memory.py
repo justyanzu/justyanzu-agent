@@ -1,0 +1,356 @@
+import time
+import datetime
+import uuid
+import os
+import sys
+import json
+from typing import List, Tuple, Type, Dict
+import torch
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+import configparser
+
+from sources.utility import timer_decorator, pretty_print, animate_thinking
+from sources.logger import Logger
+
+config = configparser.ConfigParser()
+config.read('config.ini')
+
+
+def get_latest_saved_memory_filepath(
+    agent_type: str,
+    conversation_folder: str = "conversations",
+) -> str | None:
+    """
+    返回某 agent 类型目录下按文件名排序最近的一条 memory_*.txt 的绝对路径（若无则 None）。
+    agent_type 例如 casual_agent、code_agent，与 save_memory(agent_type) 一致。
+    """
+    save_path = os.path.join(conversation_folder, agent_type)
+    if not os.path.isdir(save_path):
+        return None
+    saved_sessions = []
+    for filename in os.listdir(save_path):
+        if filename.startswith("memory_"):
+            date = filename.split("_")[1]
+            saved_sessions.append((filename, date))
+    if not saved_sessions:
+        return None
+    saved_sessions.sort(key=lambda x: x[1], reverse=True)
+    return os.path.join(save_path, saved_sessions[0][0])
+
+
+class Memory():
+    """
+    Memory is a class for managing the conversation memory
+    It provides a method to compress the memory using summarization model.
+    """
+    # 大模型上下文（token）与按字符估算的窗口：窗口字符数 = token 数 × 系数（近似 1 token ≈ 4 chars）
+    LLM_CONTEXT_TOKENS = 200_000
+    CHARS_PER_TOKEN_ESTIMATE = 4
+    # push 时：单条 content 字符数超过窗口字符数的该比例则触发 compress
+    COMPRESS_TRIGGER_WINDOW_FRACTION = 0.8
+    def __init__(self, system_prompt: str,
+                 recover_last_session: bool = False,
+                 memory_compression: bool = True,
+                 model_provider: str = "deepseek-r1:14b"):
+        self.memory = [{'role': 'system', 'content': system_prompt}]
+        
+        self.logger = Logger("memory.log")
+        self.session_time = datetime.datetime.now()
+        self.session_id = str(uuid.uuid4())
+        self.conversation_folder = f"conversations/"
+        self.session_recovered = False
+        if recover_last_session:
+            self.load_memory()
+            self.session_recovered = True
+        # memory compression system
+        self.model = None
+        self.tokenizer = None
+        self.device = self.get_cuda_device()
+        self.memory_compression = memory_compression
+        self.model_provider = model_provider
+        if self.memory_compression:
+            self.download_model()
+
+    def get_ideal_ctx(self, model_name: str) -> int:
+        """
+        返回以字符为单位的记忆窗口上限：大模型上下文 token 数 × CHARS_PER_TOKEN_ESTIMATE。
+        model_name 保留以兼容旧调用，当前不参与计算。
+        """
+        window_chars = self.LLM_CONTEXT_TOKENS * self.CHARS_PER_TOKEN_ESTIMATE
+        self.logger.info(
+            f"Memory window (chars): {window_chars} "
+            f"(= {self.LLM_CONTEXT_TOKENS} tokens × {self.CHARS_PER_TOKEN_ESTIMATE}, model ref: {model_name!r})."
+        )
+        return window_chars
+    
+    def download_model(self):
+        """Download the model if not already downloaded."""
+        animate_thinking("Loading memory compression model...", color="status")
+        self.tokenizer = AutoTokenizer.from_pretrained("pszemraj/led-base-book-summary")
+        self.model = AutoModelForSeq2SeqLM.from_pretrained("pszemraj/led-base-book-summary")
+        self.logger.info("Memory compression system initialized.")
+    
+    def get_filename(self) -> str:
+        """Get the filename for the save file."""
+        return f"memory_{self.session_time.strftime('%Y-%m-%d_%H-%M-%S')}.txt"
+    
+    def save_memory(self, agent_type: str = "casual_agent") -> None:
+        """Save the session memory to a file."""
+        if not os.path.exists(self.conversation_folder):
+            self.logger.info(f"Created folder {self.conversation_folder}.")
+            os.makedirs(self.conversation_folder)
+        save_path = os.path.join(self.conversation_folder, agent_type)
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+        filename = self.get_filename()
+        path = os.path.join(save_path, filename)
+        json_memory = json.dumps(self.memory)
+        with open(path, 'w') as f:
+            self.logger.info(f"Saved memory json at {path}")
+            f.write(json_memory)
+        if agent_type == "casual_agent":
+            try:
+                from sources.casual_chroma_store import index_casual_memory_file
+
+                conv_root = self.conversation_folder.rstrip("/\\")
+                latest = get_latest_saved_memory_filepath("casual_agent", conv_root)
+                if latest and os.path.normpath(os.path.abspath(latest)) == os.path.normpath(
+                    os.path.abspath(path)
+                ):
+                    n = index_casual_memory_file(path, conversation_root=conv_root)
+                    if n:
+                        self.logger.info(
+                            f"Indexed {n} casual_agent chunk(s) into ChromaDB (latest session only)."
+                        )
+            except Exception as e:
+                self.logger.warning(f"Casual ChromaDB indexing skipped: {e}")
+    
+    def find_last_session_path(self, path) -> str:
+        """Find the last session path."""
+        saved_sessions = []
+        for filename in os.listdir(path):
+            if filename.startswith('memory_'):
+                date = filename.split('_')[1]
+                saved_sessions.append((filename, date))
+        saved_sessions.sort(key=lambda x: x[1], reverse=True)
+        if len(saved_sessions) > 0:
+            self.logger.info(f"Last session found at {saved_sessions[0][0]}")
+            return saved_sessions[0][0]
+        return None
+    
+    def save_json_file(self, path: str, json_memory: dict) -> None:
+        """Save a JSON file."""
+        try:
+            with open(path, 'w') as f:
+                json.dump(json_memory, f)
+                self.logger.info(f"Saved memory json at {path}")
+        except Exception as e:
+            self.logger.warning(f"Error saving file {path}: {e}")
+    
+    def load_json_file(self, path: str) -> dict:
+        """Load a JSON file."""
+        json_memory = {}
+        try:
+            with open(path, 'r') as f:
+                json_memory = json.load(f)
+        except FileNotFoundError:
+            self.logger.warning(f"File not found: {path}")
+            return {}
+        except json.JSONDecodeError:
+            self.logger.warning(f"Error decoding JSON from file: {path}")
+            return {}
+        except Exception as e:
+            self.logger.warning(f"Error loading file {path}: {e}")
+            return {}
+        return json_memory
+
+    def load_memory(self, agent_type: str = "casual_agent") -> None:
+        """Load the memory from the last session."""
+        if self.session_recovered == True:
+            return
+        pretty_print(f"Loading {agent_type} past memories... ", color="status")
+        save_path = os.path.join(self.conversation_folder, agent_type)
+        if not os.path.exists(save_path):
+            pretty_print("No memory to load.", color="success")
+            return
+        filename = self.find_last_session_path(save_path)
+        if filename is None:
+            pretty_print("Last session memory not found.", color="warning")
+            return
+        path = os.path.join(save_path, filename)
+        self.memory = self.load_json_file(path) 
+        if self.memory[-1]['role'] == 'user':
+            self.memory.pop()
+        self.compress()
+        pretty_print("Session recovered successfully", color="success")
+    
+    def reset(self, memory: list = []) -> None:
+        self.logger.info("Memory reset performed.")
+        self.memory = memory
+    
+    def push(self, role: str, content: str) -> int:
+        """Push a message to the memory."""
+        window_chars = self.get_ideal_ctx(self.model_provider)
+        compress_threshold = int(window_chars * self.COMPRESS_TRIGGER_WINDOW_FRACTION)
+        if self.memory_compression and len(content) > compress_threshold:
+            self.logger.info(
+                f"Compressing memory: content len {len(content)} > {compress_threshold} "
+                f"({self.COMPRESS_TRIGGER_WINDOW_FRACTION:.0%} of window {window_chars} chars)."
+            )
+            self.compress()
+        curr_idx = len(self.memory)
+        if self.memory[curr_idx-1]['content'] == content:
+            pretty_print("Warning: same message have been pushed twice to memory", color="error")
+        time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if config["MAIN"]["provider_name"] == "openrouter":
+            self.memory.append({'role': role, 'content': content})
+        else:
+            self.memory.append({'role': role, 'content': content, 'time': time_str, 'model_used': self.model_provider})
+        return curr_idx-1
+    
+    def clear(self) -> None:
+        """Clear all memory except system prompt"""
+        self.logger.info("Memory clear performed.")
+        self.memory = self.memory[:1]
+    
+    def clear_section(self, start: int, end: int) -> None:
+        """
+        Clear a section of the memory. Ignore system message index.
+        Args:
+            start (int): Starting bound of the section to clear.
+            end (int): Ending bound of the section to clear.
+        """
+        self.logger.info(f"Clearing memory section {start} to {end}.")
+        start = max(0, start) + 1
+        end = min(end, len(self.memory)-1) + 2
+        self.memory = self.memory[:start] + self.memory[end:]
+    
+    def get(self) -> list:
+        return self.memory
+
+    def get_cuda_device(self) -> str:
+        if torch.backends.mps.is_available():
+            return "mps"
+        elif torch.cuda.is_available():
+            return "cuda"
+        else:
+            return "cpu"
+
+    def summarize(self, text: str, min_length: int = 64) -> str:
+        """
+        Summarize the text using the AI model.
+        Args:
+            text (str): The text to summarize
+            min_length (int, optional): The minimum length of the summary. Defaults to 64.
+        Returns:
+            str: The summarized text
+        """
+        if self.tokenizer is None or self.model is None:
+            self.logger.warning("No tokenizer or model to perform summarization.")
+            return text
+        if len(text) < min_length*1.5:
+            return text
+        max_length = len(text) // 2 if len(text) > min_length*2 else min_length*2
+        input_text = "summarize: " + text
+        inputs = self.tokenizer(input_text, return_tensors="pt", max_length=512, truncation=True)
+        summary_ids = self.model.generate(
+            inputs['input_ids'],
+            max_length=max_length,
+            min_length=min_length,
+            length_penalty=1.0,
+            num_beams=4,
+            early_stopping=True
+        )
+        summary = self.tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+        summary.replace('summary:', '')
+        self.logger.info(f"Memory summarized from len {len(text)} to {len(summary)}.")
+        self.logger.info(f"Summarized text:\n{summary}")
+        return summary
+    
+    #@timer_decorator
+    def compress(self) -> str:
+        """
+        Compress (summarize) the memory using the model.
+        内部可能对多条记忆多次调用 summarize；仅在整次 compress 结束后输出一行：
+        非 system 条目的内容总字符数（摘要前 → 摘要后）。
+        """
+        if self.tokenizer is None or self.model is None:
+            self.logger.warning("No tokenizer or model to perform memory compression.")
+            return
+
+        def _nonsystem_total_chars() -> int:
+            return sum(len(m["content"]) for m in self.memory if m["role"] != "system")
+
+        before_total = _nonsystem_total_chars()
+        did_compress = False
+        for i in range(len(self.memory)):
+            if self.memory[i]['role'] == 'system':
+                continue
+            if len(self.memory[i]['content']) > 1024:
+                self.memory[i]['content'] = self.summarize(self.memory[i]['content'])
+                did_compress = True
+        after_total = _nonsystem_total_chars()
+        if did_compress:
+            msg = (
+                f"[compress] 整体文本: 压缩前 {before_total} 字符 → 压缩后 {after_total} 字符"
+            )
+            self.logger.info(msg)
+            pretty_print(msg, color="success")
+    
+    def trim_text_to_max_ctx(self, text: str) -> str:
+        """
+        按字符截取文本：最多保留 ideal_ctx（窗口字符数）的 20%。
+        """
+        ideal_ctx = self.get_ideal_ctx(self.model_provider)
+        max_chars = int(ideal_ctx * 0.2)
+        return text[:max_chars]
+    
+    #@timer_decorator
+    def compress_text_to_max_ctx(self, text) -> str:
+        """
+        Compress a text to fit within the maximum context size of the model.
+        """
+        if self.tokenizer is None or self.model is None:
+            self.logger.warning("No tokenizer or model to perform memory compression.")
+            return text
+        ideal_ctx = self.get_ideal_ctx(self.model_provider)
+        if ideal_ctx is None:
+            self.logger.warning("No ideal context size found.")
+            return text
+        while len(text) > ideal_ctx:
+            self.logger.info(f"Compressing text: {len(text)} > {ideal_ctx} model context.")
+            text = self.summarize(text)
+        return text
+
+if __name__ == "__main__":
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    memory = Memory("You are a helpful assistant.",
+                    recover_last_session=False, memory_compression=True)
+
+    memory.push('user', "hello")
+    memory.push('assistant', "how can i help you?")
+    memory.push('user', "why do i get this cuda error?")
+    sample_text = """
+The error you're encountering:
+cuda.cu:52:10: fatal error: helper_functions.h: No such file or directory
+ #include <helper_functions.h>
+indicates that the compiler cannot find the helper_functions.h file. This is because the #include <helper_functions.h> directive is looking for the file in the system's include paths, but the file is either not in those paths or is located in a different directory.
+1. Use #include "helper_functions.h" Instead of #include <helper_functions.h>
+Angle brackets (< >) are used for system or standard library headers.
+Quotes (" ") are used for local or project-specific headers.
+If helper_functions.h is in the same directory as cuda.cu, change the include directive to:
+3. Verify the File Exists
+Double-check that helper_functions.h exists in the specified location. If the file is missing, you'll need to obtain or recreate it.
+4. Use the Correct CUDA Samples Path (if applicable)
+If helper_functions.h is part of the CUDA Samples, ensure you have the CUDA Samples installed and include the correct path. For example, on Linux, the CUDA Samples are typically located in /usr/local/cuda/samples/common/inc. You can include this path like so:
+Use #include "helper_functions.h" for local files.
+Use the -I flag to specify the directory containing helper_functions.h.
+Ensure the file exists in the specified location.
+    """
+    memory.push('assistant', sample_text)
+    
+    print("\n---\nmemory before:", memory.get())
+    memory.compress()
+    print("\n---\nmemory after:", memory.get())
+    #memory.save_memory()
+    
