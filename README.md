@@ -1,4 +1,71 @@
-# justyanzu-agent-
+# justyanzu-agent
+从agenticSeek项目开始学
+
+第一部分：Agent 的核心原理（打破黑盒）
+1. 疑问：Agent 到底是怎么用代码实现的？只是大模型调工具吗？
+- 核心认知：
+  - Agent 不是一个简单的函数，而是一个 “感知 (Observation) -> 思考 (Thought) -> 行动 (Action)” 的无限循环（Loop）。
+  - ReAct 模式（Reasoning + Acting）： 
+  思考 (Thought)： LLM 分析用户问题，决定是否需要用工具。
+  行动 (Action)： 如果需要，LLM 生成特定格式的文本（比如 Action: Search）。
+  执行 (Observation)： Python 代码 捕获这个关键字，运行对应的函数，拿到结果。
+  再思考 (Response)： 把函数运行的结果，喂回给 LLM，让它基于结果继续回答。
+  - 实现逻辑： While True 循环 + 历史记录追加（Memory）。
+2. 疑问：在真实代码中，怎么判断“要不要调工具”？
+- 核心认知：
+  - 旧方法： 靠正则匹配字符串（匹配用户提问的关键词）。
+  - 新方法： 靠 API 原生的 Function Calling。API 返回的 JSON 里会有专门的 tool_calls 字段，不用猜。
+3. 疑问：大模型怎么知道参数是多少（比如 order_id=1001）？
+- 核心认知：
+  - 槽位填充 (Slot Filling)： 依靠这时候我们传给大模型的 Schema (工具说明书)。
+  - 大模型利用语义理解能力，把自然语言里的信息（“1001号订单”）提取出来，填入 Schema 定义好的参数坑位里。
+4. 疑问：本地大模型返回的是 Markdown 还是 JSON？需要转化吗？
+- 核心认知 (数据流)：
+  - 大模型 (大脑) 生成的是 Markdown 格式的纯字符串。
+  - API (快递员) 把这个字符串装进 JSON 盒子 (content 字段) 传给 Python。
+  - Python 代码 拆开 JSON，拿出字符串，利用 Tag（如 ```python）定位并提取代码。
+
+---
+第二部分：本地部署与架构（AgenticSeek 项目实战）
+5. 疑问：Ollama / LM Studio 是什么？和 OpenAI 库有什么区别？
+- 核心认知：
+  - OpenAI 库 = 遥控器/协议（负责发指令）。
+  - Ollama = 本地主机/引擎（负责下载模型、跑模型）。
+  - AgenticSeek 的魔法： 用 OpenAI 的遥控器，控制本地的 Ollama 主机（通过修改 base_url）。
+6. 疑问：Docker 和 SearxNG 是什么？
+- 核心认知：
+  - Docker = 虚拟集装箱。它把复杂的软件环境打包（镜像），让你可以一键启动，不用担心环境报错。
+  - SearxNG = Agent 的眼睛。一个本地运行的隐私聚合搜索引擎，解决 Google 反爬和收费问题。
+7. 疑问：config.ini 和 .env 是干嘛的？
+- 核心认知：
+  - .env (通讯录)： 存地址、密码、路径（在哪里找服务）。
+  - config.ini (大脑设置)： 存行为逻辑（用什么模型、是否隐身、人设是什么）。
+  - 读取逻辑： 程序启动时先“查字典”（Read Config），再根据字典里的指引去“定位”（Get Path）。
+8. 疑问：我的 8GB 显存能跑吗？
+- 核心认知：
+  - 瓶颈： Agent 需要推理能力强的模型（14B+），8GB 显存跑 14B 会很卡。
+  - 方案： 勉强跑 7B（可能笨），或者改用云端 DeepSeek API（便宜且强）。
+
+---
+第三部分：源码级理解（Tool 类的本质）
+9. 疑问：为什么 config.ini 里没写工具有哪些？
+- 核心认知：
+  - 硬编码： 核心工具（浏览器、代码解释器）通常直接写在 Python 代码里，因为它们是 Agent 的基础能力，不需要用户配置。
+10. 疑问：tools.py 这个基类文件在干嘛？
+- 核心认知：
+  - __init__： 查户口，定地盘（工作目录）。
+  - load_exec_block： 翻译官。用 assert 做安全检查，用 Tag 确定目标，从 Markdown 里抠出代码。
+  - @abstractmethod： 霸王条款。父类规定子类必须实现的接口（execute）。
+11. 疑问：execution_failure_check 和 interpreter_feedback 是干嘛的？
+- 核心认知：
+  - 自我反思机制：
+    - Check： 质检员，判断刚才运行是成是败。
+    - Feedback： 教练，把报错信息翻译成“建议”，哄大模型去修 Bug。
+12. 疑问：这些 Tool 类是不是都得程序员手写？
+- 核心认知：
+  - 是的。
+  - 分工： 程序员是铸剑师（构建物理世界接口），AI 是剑客（决定何时拔剑）。
+  - Agent 工程师现状： 80% 的时间在写工具逻辑、清洗数据、写 Prompt 说明书，用确定性的代码包裹不确定性的 AI。
 2.24 一些理解：
 用户-》大模型查看skills-》大模型输出skills中规定格式的内容-》loop循环发现大模型输出的是这种规定格式内容-》执行对应工具-》工具调用返回结果给大模型-》大模型根据工具调用的返回结果-》用户
 
