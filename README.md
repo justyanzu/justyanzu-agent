@@ -1,4 +1,4 @@
-# justyanzu-agent
+# justyanzu的agent学习之旅
 从agenticSeek项目开始学
 
 第一部分：Agent 的核心原理（打破黑盒）
